@@ -1,29 +1,22 @@
 #include <ntddk.h>
 
+/*
+We dont implement symbolic link. So there is no interface with user mode world.
+No usual create/close nor read/write nor ioctl features.
+*/
+
 // https://docs.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights
 constexpr auto PROCESS_SUSPEND_RESUME = 0x0800;
-
-UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(L"\\Device\\hookps");
-UNICODE_STRING SymLinkName = RTL_CONSTANT_STRING(L"\\??\\hookps");
-
+UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(L"\\Device\\dsrtk");
 PDEVICE_OBJECT DeviceObject = nullptr;
-
-typedef NTSTATUS(*pPsSuspendProcess)(PEPROCESS Process);
-pPsSuspendProcess fPsSuspendProcess = nullptr;
-
-NTSTATUS InitializeExports()
-{
-	UNICODE_STRING PsSuspendProcessName = RTL_CONSTANT_STRING(L"PsSuspendProcess"); // exported by ntoskrnl but undocumented
-	fPsSuspendProcess = (pPsSuspendProcess)MmGetSystemRoutineAddress(&PsSuspendProcessName);
-	if (!fPsSuspendProcess)
-		return STATUS_INSUFFICIENT_RESOURCES;
-
-	return STATUS_SUCCESS;
-}
 
 // NtSuspendProcess reimplementation
 // easier than locating KeServiceDescriptorTable to find the addr of NtSuspendProcess
 // (especially on 64-bits system where it is not exported + patchguard nearby)
+// Take a look at the ntoskrnl-ntsuspendprocess.PNG screenshot
+typedef NTSTATUS(*pPsSuspendProcess)(PEPROCESS Process);
+pPsSuspendProcess fPsSuspendProcess = nullptr;
+
 NTSTATUS NtSuspendProcess(_In_ HANDLE ProcessHandle)
 {
 	auto status = STATUS_SUCCESS;
@@ -33,15 +26,14 @@ NTSTATUS NtSuspendProcess(_In_ HANDLE ProcessHandle)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
 	// access validation on ProcessHandle
-	status = ObReferenceObjectByHandle(
-		ProcessHandle,
+	status = ObReferenceObjectByHandle( // WithTag
+		ProcessHandle,			// Object handle
 		PROCESS_SUSPEND_RESUME, // Not a documented access mask
-		*PsProcessType,
-		KernelMode,
-		(PVOID *)&Process,
-		nullptr
+		*PsProcessType,			// Type of pointer: process
+		KernelMode,				// Object lives in the kernel
+		(PVOID *)&Process,		// PEPROCESS
+		nullptr					// NULL
 	);
-
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -62,12 +54,12 @@ void OnProcessNotify(_In_ PEPROCESS Process, _In_ HANDLE ProcessId, _In_ PPS_CRE
 	if (!CreateInfo->FileOpenNameAvailable || !CreateInfo->ImageFileName)
 		return;
 
-	KdPrint(("PSHook: process create: %ws\n", CreateInfo->ImageFileName->Buffer));
-	if (wcsstr(CreateInfo->ImageFileName->Buffer, L"Calculator.exe") == nullptr)
+	DbgPrint("PSHook: process create: %ws\n", CreateInfo->ImageFileName->Buffer);
+	if (wcsstr(CreateInfo->ImageFileName->Buffer, L"\\Calculator.exe") == nullptr)
 		return;
 
-	DbgPrint(("PSHook: nope!\n"));
-	// CreateInfo->CreationStatus = STATUS_ACCESS_DENIED; // access denied popup :(
+	DbgPrint("PSHook: nope!\n");
+	// CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
 	NtSuspendProcess(Process);
 }
 
@@ -75,13 +67,16 @@ NTSTATUS CompleteIrp(_In_ PIRP Irp, _In_opt_ NTSTATUS status = STATUS_SUCCESS, _
 {
 	Irp->IoStatus.Status = status;
 	Irp->IoStatus.Information = info;
-	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	IoCompleteRequest(
+		Irp,				// Pointer to the IRP to be completed
+		IO_NO_INCREMENT		// 0
+	);
 	return status;
 }
 
 NTSTATUS HandleCreateClose(_In_ PDEVICE_OBJECT, _In_ PIRP Irp)
 {
-	DbgPrint(("PSHook: create/close\n"));
+	DbgPrint("PSHook: create/close\n");
 	return CompleteIrp(Irp);
 }
 
@@ -90,9 +85,8 @@ void Unload(_In_ PDRIVER_OBJECT DriverObject)
 	UNREFERENCED_PARAMETER(DriverObject);
 
 	PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
-	IoDeleteSymbolicLink(&SymLinkName);
 	IoDeleteDevice(DeviceObject);
-	DbgPrint(("PSHook: unloaded\n"));
+	DbgPrint("PSHook: unloaded\n");
 }
 
 extern "C"
@@ -101,33 +95,44 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	UNREFERENCED_PARAMETER(RegistryPath);
 	auto status = STATUS_SUCCESS;
 
-	status = IoCreateDevice(DriverObject, 0, &DeviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &DeviceObject);
-	if (!NT_SUCCESS(status))
+	// PsSuspendProcess exported by ntoskrnl but undocumented (referenced by Geoff Chappell, undocumented.ntinternals.net, ReactOS)
+	UNICODE_STRING PsSuspendProcessName = RTL_CONSTANT_STRING(L"PsSuspendProcess");
+	// MmGetSystemRoutineAddress returns a ptr to the requested routine if present in kernel/HAL
+	fPsSuspendProcess = (pPsSuspendProcess)MmGetSystemRoutineAddress(&PsSuspendProcessName);
+	if (!fPsSuspendProcess)
 	{
-		DbgPrint(("PSHook: failed to create device\n"));
-		return status;
+		DbgPrint("PSHook: cannot find PsSuspendProcess");
+		return STATUS_NOT_FOUND;
 	}
-
-	status = IoCreateSymbolicLink(&SymLinkName, &DeviceName);
+	
+	status = IoCreateDevice(
+		DriverObject,			// Pointer to the driver object to which this device belongs to
+		0,						// extra bytes to allocate for struct DEVICE_OBJECT
+		&DeviceName,			// internal device name (under ’Device’ Object Manager directory)
+		FILE_DEVICE_UNKNOWN,	// device type is only relevant to some hardware drivers
+		0,						// device characteristics, typically not used for software drivers
+		FALSE,					// no exclusive client access
+		&DeviceObject			// out ptr for the device object
+	);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrint(("PSHook: failed to create symlink\n"));
-		IoDeleteDevice(DeviceObject);
+		DbgPrint("PSHook: failed to create device\n");
 		return status;
 	}
 
 	// Pass /integritycheck linker flag
-	status = PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
-	if (!NT_SUCCESS(status)) {
+	status = PsSetCreateProcessNotifyRoutineEx(
+		OnProcessNotify,	// Process create/exit notification routine
+		FALSE				// We’re registering the callback
+	);
+	if (!NT_SUCCESS(status))
+	{
 		DbgPrint("PSHook: failed to register process callback\n");
 		IoDeleteDevice(DeviceObject);
 		return status;
 	}
 
 	DriverObject->DriverUnload = Unload;
-	DriverObject->MajorFunction[IRP_MJ_CREATE] = HandleCreateClose;
-	DriverObject->MajorFunction[IRP_MJ_CLOSE] = HandleCreateClose;
-
-	DbgPrint(("PSHook loaded\n"));
+	DbgPrint("PSHook loaded\n");
 	return status;
 }
