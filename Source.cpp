@@ -3,6 +3,8 @@
 /*
 We dont implement symbolic link. So there is no interface with user mode world.
 No usual create/close nor read/write nor ioctl features.
+
+todo: https://vxug.fakedoma.in/translations/FR/cacherdesdriverschargesavecDKOM.html
 */
 
 // https://docs.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights
@@ -108,7 +110,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	status = IoCreateDevice(
 		DriverObject,			// Pointer to the driver object to which this device belongs to
 		0,						// extra bytes to allocate for struct DEVICE_OBJECT
-		&DeviceName,			// internal device name (under ’Device’ Object Manager directory)
+		&DeviceName,			// internal device name (under â€™Deviceâ€™ Object Manager directory)
 		FILE_DEVICE_UNKNOWN,	// device type is only relevant to some hardware drivers
 		0,						// device characteristics, typically not used for software drivers
 		FALSE,					// no exclusive client access
@@ -123,7 +125,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	// Pass /integritycheck linker flag
 	status = PsSetCreateProcessNotifyRoutineEx(
 		OnProcessNotify,	// Process create/exit notification routine
-		FALSE				// We’re registering the callback
+		FALSE				// Weâ€™re registering the callback
 	);
 	if (!NT_SUCCESS(status))
 	{
